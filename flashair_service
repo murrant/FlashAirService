@@ -1,0 +1,162 @@
+#!/usr/bin/python3
+
+import argparse, time, urllib.request, sys, csv, datetime
+from os.path import expanduser, exists
+from os import makedirs
+from subprocess import run, DEVNULL, STDOUT
+from sys import exit
+from shutil import which
+
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-f", "--flashair-ip", default="flashair.local")
+#parser.add_argument("-t", "--ping-timeout", type=int, default=5)
+parser.add_argument("-s", "--source-folder", default="/DCIM")
+parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
+parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
+parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attemps if running as daemon", default=30)
+args = parser.parse_args()
+
+#timezone
+tz = datetime.timezone.utc
+
+#csv
+csvFileListFields = ['dir', 'name', 'size', 'attr', 'date', 'time']
+
+# Find commands
+jhead = which("jhead")
+exiftool = which("exiftool")
+fping = which("fping")
+if fping:
+    ping = [fping, "-r 0", args.flashair_ip]
+else:
+    ping = [which("ping"), "-c 1", args.flashair_ip]
+
+# output dir
+#makedirs(args.dest_folder, exist_ok=True)
+
+def alive():
+    return True
+    return (run(ping, stdout=DEVNULL, stderr=STDOUT).returncode == 0)
+
+def faCommand(encoded_url, data=None):
+    command = "http://" + args.flashair_ip + "/" + encoded_url
+    print("Sending: " + command)
+    try:
+        reader = urllib.request.urlopen(command)
+    except Exception:
+        pass
+        raise Exception("Command Failed")
+
+    #return data
+    data = reader.read().decode('utf-8')
+    #print(data)
+    return data
+
+def faTimeZone():
+    try:
+        data = faCommand("command.cgi?op=221")
+    except Exception:
+        return datetime.timezone.utc
+    delta = datetime.timedelta(minutes=int(data)*15)
+    return datetime.timezone(delta)
+
+
+def faUsed():
+    data = faCommand("command.cgi?op=140")
+    sectors,bytes_per = data.split(",")
+    used,total = sectors.split("/")
+    return {'perc' : used/total, 'used' : used*bytes_per, 'total' : total*bytes_per}
+
+
+def faUpdated():
+    return faCommand("command.cgi?op=102") == "1"
+
+def faList(dir="/"):
+    data = []
+    raw = faCommand("command.cgi?op=100&DIR=" + dir)
+    lines = raw.splitlines()
+    first = lines.pop(0)
+    if first != "WLANSD_FILELIST":
+        raise Exception("Invalid file list data")
+
+    reader = csv.DictReader(lines, csvFileListFields)
+    data = list(reader)
+    return data
+
+def parseDate(data):
+    data = int(data)
+    day = (data & 0b0000000000011111);
+    month = (data & 0b0000000111100000) >> 5;
+    year= ((data & 0b1111111000000000) >> 9) + 1980;
+    return datetime.date(year, month, day)
+
+def parseTime(data):
+    data = int(data)
+    seconds = (data & 0b0000000000011111) * 2;
+    minutes = (data & 0b0000011111100000) >> 5;
+    hours = (data & 0b1111100000000000) >> 11;
+    return datetime.time(hours, minutes, seconds, 0, tz)
+
+def destName(path, base=None):
+    if not base:
+        base = args.source_folder
+    base = base.rstrip("/")
+    result = path.replace(base, "").lstrip("/")
+    return args.dest_folder.rstrip("/") + "/" + result
+
+def copy(src_file, dst_file=None):
+    src = "http://" + args.flashair_ip + src_file
+    if dst_file:
+        dst = dst_file;
+    else:
+        dst = destName(src_file)
+
+    if exists(dst):
+        print(dst + " Exists")
+        #raise FileExistsError(dst + " Exists")
+    else:
+        print("Transferring file: " + src_file + " to " + dst)
+        urllib.request.urlretrieve(src, dst)
+
+def syncFile(file):
+    copy(file)
+
+def syncDir(dir):
+    files = faList(dir)
+    dst_dir = destName(dir)
+    print("Making directory: " + dst_dir)
+    makedirs(dst_dir, exist_ok=True)
+
+    for file in files:
+        path = file['dir'].rstrip("/") + "/" + file['name']
+        if int(file['attr']) & 16:
+            # bit 5 = dir, recurse into dir
+            syncDir(path)
+            continue
+        print(str(file) + " " + str(parseDate(file['date'])) + " " + str(parseTime(file['time'])))
+        syncFile(path)
+
+
+while True:
+    if alive():
+        print("Got Ping!")
+        tz = faTimeZone()
+
+        #print(faList(args.source_folder))
+        syncDir(args.source_folder)
+        #syncDir("/")
+    elif not args.daemon:
+        # don't spam the logs when daemonized, but be friendly to humans
+        print("Could not reach FlashAir card: " + args.flashair_ip)
+
+
+    # only run once by default, if --daemon loop
+    if not args.daemon:
+        exit(0)
+
+    # wait so we don't monopolize the CPU
+    time.sleep(args.interval)
+
+
