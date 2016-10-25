@@ -1,28 +1,50 @@
 #!/usr/bin/python3
 
-import argparse, time, urllib.request, sys, csv, datetime
-from os.path import expanduser, exists
+import argparse, time, urllib.request, sys, csv, datetime, sqlite3
+from os.path import expanduser, exists, basename, dirname
 from os import makedirs
-from subprocess import run, DEVNULL, STDOUT
+from subprocess import run, DEVNULL, STDOUT, PIPE
 from sys import exit
-from shutil import which
-
+from shutil import which, move
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--flashair-ip", default="flashair.local")
 #parser.add_argument("-t", "--ping-timeout", type=int, default=5)
-parser.add_argument("-s", "--source-folder", default="/DCIM")
+parser.add_argument("-s", "--source-folder", default=["/DCIM"], action='append')
 parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
+parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="count", default=0)
 parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
 parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attemps if running as daemon", default=30)
 args = parser.parse_args()
+
+# default level for non-daemon is 1
+if not args.daemon:
+    args.verbosity += 1
+
+def debug(message, level=1):
+    if level <= args.verbosity:
+        print(message)
+
+debug(args, 3)
+
 
 #timezone
 tz = datetime.timezone.utc
 
 #csv
 csvFileListFields = ['dir', 'name', 'size', 'attr', 'date', 'time']
+
+#sqlite transferred db
+makedirs(args.dest_folder, exist_ok=True)
+conn = sqlite3.connect(args.dest_folder + "/.transferred.db")
+conn.execute("""CREATE TABLE IF NOT EXISTS  transferred ( 
+    file TEXT NOT NULL,
+    timestamp DATETIME NOT NULL,
+    PRIMARY KEY (file, timestamp)
+    );""")
+cursor = conn.cursor()
+
 
 # Find commands
 jhead = which("jhead")
@@ -33,16 +55,14 @@ if fping:
 else:
     ping = [which("ping"), "-c 1", args.flashair_ip]
 
-# output dir
-#makedirs(args.dest_folder, exist_ok=True)
+
 
 def alive():
-    return True
     return (run(ping, stdout=DEVNULL, stderr=STDOUT).returncode == 0)
 
 def faCommand(encoded_url, data=None):
     command = "http://" + args.flashair_ip + "/" + encoded_url
-    print("Sending: " + command)
+    debug("Sending: " + command, 2)
     try:
         reader = urllib.request.urlopen(command)
     except Exception:
@@ -75,15 +95,19 @@ def faUpdated():
 
 def faList(dir="/"):
     data = []
-    raw = faCommand("command.cgi?op=100&DIR=" + dir)
-    lines = raw.splitlines()
-    first = lines.pop(0)
-    if first != "WLANSD_FILELIST":
-        raise Exception("Invalid file list data")
+    try:
+        raw = faCommand("command.cgi?op=100&DIR=" + dir)
+        lines = raw.splitlines()
+        first = lines.pop(0)
+        if first != "WLANSD_FILELIST":
+            raise Exception("Invalid file list data")
 
-    reader = csv.DictReader(lines, csvFileListFields)
-    data = list(reader)
-    return data
+        reader = csv.DictReader(lines, csvFileListFields)
+        data = list(reader)
+        return data
+    except urllib.error.HTTPError as e:
+        if "HTTP Error 404" in str(e):
+            raise FileNotFoundError(str(e))
 
 def parseDate(data):
     data = int(data)
@@ -99,54 +123,94 @@ def parseTime(data):
     hours = (data & 0b1111100000000000) >> 11;
     return datetime.time(hours, minutes, seconds, 0, tz)
 
-def destName(path, base=None):
-    if not base:
-        base = args.source_folder
-    base = base.rstrip("/")
-    result = path.replace(base, "").lstrip("/")
-    return args.dest_folder.rstrip("/") + "/" + result
+def destName(file):
+    if 'dest_path' in file:
+        return file['dest_path']
+    
+    base = file['dir'].strip("/")
+    return args.dest_folder.rstrip("/") + "/" + base + "/" + file['name']
 
-def copy(src_file, dst_file=None):
-    src = "http://" + args.flashair_ip + src_file
-    if dst_file:
-        dst = dst_file;
-    else:
-        dst = destName(src_file)
+def checkDownloaded(file):
+    cursor.execute("SELECT * FROM transferred WHERE file=? AND timestamp=?", (file['src_path'], file['datetime'].timestamp()))
+    if cursor.fetchone() is None:
+        if exists(file['dest_path']):
+            raise FileExistsError(file['dest_path'] + " exists.")
+        return False
+    return True
 
-    if exists(dst):
-        print(dst + " Exists")
-        #raise FileExistsError(dst + " Exists")
+def rotateFile(filename):
+    if jhead:
+        debug("Automatically correcting orientation", 2)
+        proc = run([jhead, "-autorot", "-ft", filename], stdout=DEVNULL, stderr=STDOUT)
+        debug(" ".join(proc.args), 3)
+        return True
+
+def renameFile(file):
+    if exiftool:
+        debug("Renaming file based on exif data", 2)
+        proc = run([exiftool, "-p", "$DateTimeOriginal", "-d", "/%Y-%m/%Y-%m_%d-%H:%M:%S_", file['dest_path']], stdout=PIPE, stderr=DEVNULL)
+        debug(format(proc), 3)
+        dest = args.dest_folder + proc.stdout.decode().strip() + file['name']
+
     else:
-        print("Transferring file: " + src_file + " to " + dst)
-        urllib.request.urlretrieve(src, dst)
+        debug("Renaming file based on file creation date", 2)
+        dest = args.dest_folder + file['datetime'].strftime("/%Y-%m/%Y-%m-%d_%H:%M:%S_") + file['name']
+
+    makedirs(dirname(dest), exist_ok=True)
+    move(file['dest_path'], dest)
+    return dest
 
 def syncFile(file):
-    copy(file)
+    src = "http://" + args.flashair_ip + file['src_path']
+    dst = file['dest_path']
+
+    try:
+        if not checkDownloaded(file):
+            debug(file, 2)
+            urllib.request.urlretrieve(src, dst)
+            debug("Inserting into transferred db: " + file['src_path'] + " " + str(file['datetime'].timestamp()), 2)
+            cursor.execute("INSERT INTO transferred values(?,?)", (file['src_path'], int(file['datetime'].timestamp())))
+            debug("Inserted: " + str(cursor.lastrowid), 3)
+            rotateFile(file['dest_path'])
+            file['final_path'] = renameFile(file)
+            print("Transferred file: " + file['src_path'] + " to " + file['final_path'])
+                
+    except FileExistsError as e:
+        debug(str(e))
+        
+
 
 def syncDir(dir):
     files = faList(dir)
-    dst_dir = destName(dir)
-    print("Making directory: " + dst_dir)
-    makedirs(dst_dir, exist_ok=True)
-
+    debug(files, 4)
+    
     for file in files:
-        path = file['dir'].rstrip("/") + "/" + file['name']
+        file['src_path'] = file['dir'].rstrip("/") + "/" + file['name']
         if int(file['attr']) & 16:
             # bit 5 = dir, recurse into dir
-            syncDir(path)
+            dst_dir = args.dest_folder + "/" + file['src_path'].strip("/")
+            debug("Making directory: " + dst_dir, 2)
+            makedirs(dst_dir, exist_ok=True)
+            syncDir(file['src_path'])
             continue
-        print(str(file) + " " + str(parseDate(file['date'])) + " " + str(parseTime(file['time'])))
-        syncFile(path)
+        file['dest_path'] = destName(file)
+        file['datetime'] = datetime.datetime.combine(parseDate(file['date']), parseTime(file['time']))
 
+        syncFile(file)
+
+print("Starting " + basename(__file__) + "...")
+print("Syncing " + str(args.source_folder) + " from " + args.flashair_ip)
 
 while True:
     if alive():
-        print("Got Ping!")
-        tz = faTimeZone()
+        debug("FlashAir card found!")
+#        if faUpdated():
+#            tz = faTimeZone()
 
-        #print(faList(args.source_folder))
-        syncDir(args.source_folder)
-        #syncDir("/")
+
+        for folder in args.source_folder:
+            syncDir(folder)
+
     elif not args.daemon:
         # don't spam the logs when daemonized, but be friendly to humans
         print("Could not reach FlashAir card: " + args.flashair_ip)
@@ -154,9 +218,12 @@ while True:
 
     # only run once by default, if --daemon loop
     if not args.daemon:
-        exit(0)
+        break
 
     # wait so we don't monopolize the CPU
     time.sleep(args.interval)
 
+# save sqlite and close
+conn.commit()
+conn.close()
 
