@@ -1,21 +1,22 @@
 #!/usr/bin/python3
 
-import argparse, time, urllib.request, sys, csv, datetime, sqlite3
-from os.path import expanduser, exists, basename, dirname
-from os import makedirs
+import argparse, time, urllib.request, sys, csv, datetime, sqlite3, sys
+from os.path import expanduser, exists, basename, dirname, getsize
+from os import makedirs, SEEK_END
 from subprocess import run, DEVNULL, STDOUT, PIPE
-from sys import exit
 from shutil import which, move
+from socket import timeout as SocketTimeoutError
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--flashair-ip", default="flashair.local")
 #parser.add_argument("-t", "--ping-timeout", type=int, default=5)
-parser.add_argument("-s", "--source-folder", default=["/DCIM"], action='append')
+parser.add_argument("-s", "--source-folder", default=["/DCIM", "/PRIVATE/AVCHD/BDMV/STREAM"], action='append')
 parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
 parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="count", default=0)
 parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
-parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attemps if running as daemon", default=30)
+parser.add_argument("-p", "--progress", help="Print progress for file transfers", action="store_true")
+parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attempts if running as daemon", default=10)
 args = parser.parse_args()
 
 # default level for non-daemon is 1
@@ -29,11 +30,11 @@ def debug(message, level=1):
 debug(args, 3)
 
 
-#timezone
 tz = datetime.timezone.utc
-
-#csv
-csvFileListFields = ['dir', 'name', 'size', 'attr', 'date', 'time']
+forceUpdate = False
+TIMEOUT = 5.0 # seconds
+CHUNK_SIZE = 25*1024 # KB
+CSV_LIST_FIELDS = ['dir', 'name', 'size', 'attr', 'date', 'time']
 
 #sqlite transferred db
 makedirs(args.dest_folder, exist_ok=True)
@@ -58,7 +59,13 @@ else:
 
 
 def alive():
-    return (run(ping, stdout=DEVNULL, stderr=STDOUT).returncode == 0)
+    data = run(ping, stdout=DEVNULL, stderr=STDOUT).returncode
+    alive = (data == 0)
+    if alive:
+        debug("Ping success: {}".format(args.flashair_ip))
+    else:
+        debug("Ping failure: {}".format(args.flashair_ip))
+    return alive
 
 def faCommand(encoded_url, data=None):
     command = "http://" + args.flashair_ip + "/" + encoded_url
@@ -71,7 +78,7 @@ def faCommand(encoded_url, data=None):
 
     #return data
     data = reader.read().decode('utf-8')
-    #print(data)
+    debug(data, 3)
     return data
 
 def faTimeZone():
@@ -102,7 +109,7 @@ def faList(dir="/"):
         if first != "WLANSD_FILELIST":
             raise Exception("Invalid file list data")
 
-        reader = csv.DictReader(lines, csvFileListFields)
+        reader = csv.DictReader(lines, CSV_LIST_FIELDS)
         data = list(reader)
         return data
     except urllib.error.HTTPError as e:
@@ -123,20 +130,13 @@ def parseTime(data):
     hours = (data & 0b1111100000000000) >> 11;
     return datetime.time(hours, minutes, seconds, 0, tz)
 
-def destName(file):
-    if 'dest_path' in file:
-        return file['dest_path']
-    
-    base = file['dir'].strip("/")
-    return args.dest_folder.rstrip("/") + "/" + base + "/" + file['name']
+def tempFile(src_path):
+    return "/tmp/" + src_path.lstrip("/").replace("/", "_")
 
 def checkDownloaded(file):
-    cursor.execute("SELECT * FROM transferred WHERE file=? AND timestamp=?", (file['src_path'], file['datetime'].timestamp()))
-    if cursor.fetchone() is None:
-        if exists(file['dest_path']):
-            raise FileExistsError(file['dest_path'] + " exists.")
-        return False
-    return True
+    cursor.execute("SELECT file FROM transferred WHERE file=? AND timestamp=?", (file['src_path'], file['datetime'].timestamp()))
+    row = cursor.fetchone()
+    return row != None
 
 def rotateFile(filename):
     if jhead:
@@ -144,41 +144,85 @@ def rotateFile(filename):
         proc = run([jhead, "-autorot", "-ft", filename], stdout=DEVNULL, stderr=STDOUT)
         debug(" ".join(proc.args), 3)
         return True
+    return False
 
 def renameFile(file):
+    dest = None
     if exiftool:
         debug("Renaming file based on exif data", 2)
-        proc = run([exiftool, "-p", "$DateTimeOriginal", "-d", "/%Y-%m/%Y-%m_%d-%H:%M:%S_", file['dest_path']], stdout=PIPE, stderr=DEVNULL)
+        proc = run([exiftool, "-p", "$DateTimeOriginal", "-d", "/%Y-%m/%Y-%m_%d-%H:%M:%S_", file['temp_file']], stdout=PIPE, stderr=DEVNULL)
         debug(format(proc), 3)
-        dest = args.dest_folder + proc.stdout.decode().strip() + file['name']
+        rel_dir = proc.stdout.decode().strip()
+        if rel_dir:
+            dest = args.dest_folder + rel_dir + file['name']
 
-    else:
+    if not dest:
         debug("Renaming file based on file creation date", 2)
-        dest = args.dest_folder + file['datetime'].strftime("/%Y-%m/%Y-%m-%d_%H:%M:%S_") + file['name']
+        dest = "{}/{}_{}".format(args.dest_folder, file['datetime'].strftime("%Y-%m/%Y-%m-%d_%H:%M:%S"), file['name'])
+        #args.dest_folder + file['datetime'].strftime("/%Y-%m/%Y-%m-%d_%H:%M:%S_") + file['name']
 
     makedirs(dirname(dest), exist_ok=True)
-    move(file['dest_path'], dest)
+    move(file['temp_file'], dest)
     return dest
 
-def syncFile(file):
-    src = "http://" + args.flashair_ip + file['src_path']
-    dst = file['dest_path']
+def print_progress(ratio):
+    count = int(ratio * 20)
+    sys.stdout.write('\r')
+    sys.stdout.write("[{:<20}] {:.2f}%".format('='*count, 100*ratio))
+    sys.stdout.flush()
 
+
+def transferFile(file):
+    src = "http://" + args.flashair_ip + file['src_path']
+    tmp = file['temp_file']
+    file_size = int(file['size'])
+    request = urllib.request.Request(src)
+
+    bytes_read = 0
+    if exists(tmp):
+        # resume transfer with an http range request
+        bytes_read = getsize(tmp)
+        request.add_header('Range', 'bytes={}-'.format(bytes_read))
+
+    # The file might be complete, skip downloading it if it is
+    if bytes_read < file_size:
+        stream = urllib.request.urlopen(request, timeout=TIMEOUT)
+        with open(tmp, 'ab') as f:
+            while(bytes_read < file_size):
+                chunk = stream.read(CHUNK_SIZE)
+                chunk_len = len(chunk)
+                if chunk_len == CHUNK_SIZE or bytes_read + chunk_len == file_size:
+                    bytes_read += len(chunk)
+                    f.write(chunk)
+                    if args.progress:
+                        print_progress(bytes_read / file_size)
+                else:
+                    raise IOError("Partial chunk")
+
+            if args.progress:
+                print() # print line return after progress bar
+    
+    debug("Inserting into transferred db: {} {:.0f}".format(file['src_path'], file['datetime'].timestamp()), 2)
+    cursor.execute("INSERT INTO transferred values(?,?)", (file['src_path'], int(file['datetime'].timestamp())))
+    conn.commit() # make sure the db is saved in case we get interrupted
+    debug("Inserted: {}".format(cursor.lastrowid), 3)
+
+def syncFile(file):
+    global forceUpdate
     try:
         if not checkDownloaded(file):
-            debug(file, 2)
-            urllib.request.urlretrieve(src, dst)
-            debug("Inserting into transferred db: " + file['src_path'] + " " + str(file['datetime'].timestamp()), 2)
-            cursor.execute("INSERT INTO transferred values(?,?)", (file['src_path'], int(file['datetime'].timestamp())))
-            debug("Inserted: " + str(cursor.lastrowid), 3)
-            rotateFile(file['dest_path'])
-            file['final_path'] = renameFile(file)
-            print("Transferred file: " + file['src_path'] + " to " + file['final_path'])
+            debug(file, 3)
+            print("Transferring file: {}".format(file['src_path']))
+            transferFile(file)
+            rotateFile(file['temp_file'])
+            file['dest_path'] = renameFile(file)
+            print("Saved to: {}".format(file['dest_path']))
                 
-    except FileExistsError as e:
-        debug(str(e))
-        
-
+    except (SocketTimeoutError, IOError) as e:
+        if args.progress:
+            print() # print line return after progress bar
+        print("Transfer interrupted: {}".format(e))
+        forceUpdate = True
 
 def syncDir(dir):
     files = faList(dir)
@@ -188,28 +232,30 @@ def syncDir(dir):
         file['src_path'] = file['dir'].rstrip("/") + "/" + file['name']
         if int(file['attr']) & 16:
             # bit 5 = dir, recurse into dir
-            dst_dir = args.dest_folder + "/" + file['src_path'].strip("/")
-            debug("Making directory: " + dst_dir, 2)
-            makedirs(dst_dir, exist_ok=True)
+            #dst_dir = args.dest_folder + "/" + file['src_path'].strip("/")
+            #debug("Making directory: " + dst_dir, 3)
+            #makedirs(dst_dir, exist_ok=True)
             syncDir(file['src_path'])
             continue
-        file['dest_path'] = destName(file)
+        file['temp_file'] = tempFile(file['src_path'])
         file['datetime'] = datetime.datetime.combine(parseDate(file['date']), parseTime(file['time']))
 
         syncFile(file)
+        print("force update syncdir: {}".format(forceUpdate))
 
 print("Starting " + basename(__file__) + "...")
 print("Syncing " + str(args.source_folder) + " from " + args.flashair_ip)
 
 while True:
     if alive():
+        global forceUpdate
         debug("FlashAir card found!")
-#        if faUpdated():
-#            tz = faTimeZone()
+        if forceUpdate or faUpdated():
+            forceUpdate = False
+            tz = faTimeZone()
 
-
-        for folder in args.source_folder:
-            syncDir(folder)
+            for folder in args.source_folder:
+                syncDir(folder)
 
     elif not args.daemon:
         # don't spam the logs when daemonized, but be friendly to humans
@@ -222,6 +268,7 @@ while True:
 
     # wait so we don't monopolize the CPU
     time.sleep(args.interval)
+
 
 # save sqlite and close
 conn.commit()
