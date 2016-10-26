@@ -241,7 +241,7 @@ def syncDir(dir):
         file['datetime'] = datetime.datetime.combine(parseDate(file['date']), parseTime(file['time']))
 
         syncFile(file)
-        print("force update syncdir: {}".format(forceUpdate))
+
 
 print("Starting " + basename(__file__) + "...")
 print("Syncing " + str(args.source_folder) + " from " + args.flashair_ip)
