@@ -62,9 +62,9 @@ def alive():
     data = run(ping, stdout=DEVNULL, stderr=STDOUT).returncode
     alive = (data == 0)
     if alive:
-        debug("Ping success: {}".format(args.flashair_ip))
+        debug("Ping success: {}".format(args.flashair_ip), 3)
     else:
-        debug("Ping failure: {}".format(args.flashair_ip))
+        debug("Ping failure: {}".format(args.flashair_ip), 3)
     return alive
 
 def faCommand(encoded_url, data=None):
@@ -201,7 +201,7 @@ def transferFile(file):
 
             if args.progress:
                 print() # print line return after progress bar
-    
+
     debug("Inserting into transferred db: {} {:.0f}".format(file['src_path'], file['datetime'].timestamp()), 2)
     cursor.execute("INSERT INTO transferred values(?,?)", (file['src_path'], int(file['datetime'].timestamp())))
     conn.commit() # make sure the db is saved in case we get interrupted
