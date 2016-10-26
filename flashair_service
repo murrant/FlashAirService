@@ -27,8 +27,7 @@ def debug(message, level=1):
     if level <= args.verbosity:
         print(message)
 
-debug(args, 3)
-
+debug("Command line arguments: {}".format(args), 3)
 
 tz = datetime.timezone.utc
 forceUpdate = False
@@ -159,7 +158,6 @@ def renameFile(file):
     if not dest:
         debug("Renaming file based on file creation date", 2)
         dest = "{}/{}_{}".format(args.dest_folder, file['datetime'].strftime("%Y-%m/%Y-%m-%d_%H:%M:%S"), file['name'])
-        #args.dest_folder + file['datetime'].strftime("/%Y-%m/%Y-%m-%d_%H:%M:%S_") + file['name']
 
     makedirs(dirname(dest), exist_ok=True)
     move(file['temp_file'], dest)
@@ -248,7 +246,6 @@ print("Syncing " + str(args.source_folder) + " from " + args.flashair_ip)
 
 while True:
     if alive():
-        global forceUpdate
         debug("FlashAir card found!")
         if forceUpdate or faUpdated():
             forceUpdate = False
