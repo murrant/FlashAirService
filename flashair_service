@@ -1,22 +1,22 @@
 #!/usr/bin/python3
 
-import argparse, time, urllib.request, sys, csv, datetime, sqlite3, sys
+import argparse, urllib.request, sys, csv, datetime, sqlite3, sys
 from os.path import expanduser, exists, basename, dirname, getsize
 from os import makedirs, SEEK_END
 from subprocess import run, DEVNULL, STDOUT, PIPE
 from shutil import which, move
 from socket import timeout as SocketTimeoutError
+from time import sleep
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--flashair-ip", default="flashair.local")
-#parser.add_argument("-t", "--ping-timeout", type=int, default=5)
 parser.add_argument("-s", "--source-folder", default=["/DCIM", "/PRIVATE/AVCHD/BDMV/STREAM"], action='append')
 parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
 parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="count", default=0)
 parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
 parser.add_argument("-p", "--progress", help="Print progress for file transfers", action="store_true")
-parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attempts if running as daemon", default=10)
+parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attempts if running as daemon", default=20)
 args = parser.parse_args()
 
 # default level for non-daemon is 1
@@ -264,7 +264,7 @@ while True:
         break
 
     # wait so we don't monopolize the CPU
-    time.sleep(args.interval)
+    sleep(args.interval)
 
 
 # save sqlite and close

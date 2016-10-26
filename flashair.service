@@ -1,0 +1,10 @@
+[Unit]
+Description=FlashAir Image/Video transfer
+
+[Service]
+User=flashair
+ExecStart=/usr/bin/python3 /usr/local/bin/flashair_service --daemon
+
+[Install]
+WantedBy=multi-user.target
+
