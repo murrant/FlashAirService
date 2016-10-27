@@ -13,7 +13,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--flashair-ip", default="flashair.local")
 parser.add_argument("-s", "--source-folder", default=["/DCIM", "/PRIVATE/AVCHD/BDMV/STREAM"], action='append')
 parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
+parser.add_argument("-c", "--cleanup-percent", type=int, help="Percentage of space to keep free", default=-1)
 parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="count", default=0)
+parser.add_argument("--force", help="skip check for changes, this will cause extra traffic/stress", action="store_true")
 parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
 parser.add_argument("-p", "--progress", help="Print progress for file transfers", action="store_true")
 parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attempts if running as daemon", default=20)
@@ -38,9 +40,11 @@ CSV_LIST_FIELDS = ['dir', 'name', 'size', 'attr', 'date', 'time']
 #sqlite transferred db
 makedirs(args.dest_folder, exist_ok=True)
 conn = sqlite3.connect(args.dest_folder + "/.transferred.db")
-conn.execute("""CREATE TABLE IF NOT EXISTS  transferred ( 
+conn.execute("""CREATE TABLE IF NOT EXISTS  transferred (
+    id INT NOT NULL PRIMARY KEY,
     file TEXT NOT NULL,
     timestamp DATETIME NOT NULL,
+    size INT DEFAULT 0,
     PRIMARY KEY (file, timestamp)
     );""")
 cursor = conn.cursor()
@@ -89,11 +93,14 @@ def faTimeZone():
     return datetime.timezone(delta)
 
 
-def faUsed():
+def faFree():
     data = faCommand("command.cgi?op=140")
     sectors,bytes_per = data.split(",")
-    used,total = sectors.split("/")
-    return {'perc' : used/total, 'used' : used*bytes_per, 'total' : total*bytes_per}
+    free,total = sectors.split("/")
+    bytes_per = int(bytes_per)
+    free = int(free)
+    total = int(total)
+    return {'percent' : free/total*100, 'free' : free*bytes_per, 'total' : total*bytes_per}
 
 
 def faUpdated():
@@ -160,6 +167,8 @@ def renameFile(file):
         dest = "{}/{}_{}".format(args.dest_folder, file['datetime'].strftime("%Y-%m/%Y-%m-%d_%H:%M:%S"), file['name'])
 
     makedirs(dirname(dest), exist_ok=True)
+    if exists(dest):
+        raise FileExistsError("Destination file exists: {}".format(dest))
     move(file['temp_file'], dest)
     return dest
 
@@ -200,8 +209,8 @@ def transferFile(file):
             if args.progress:
                 print() # print line return after progress bar
 
-    debug("Inserting into transferred db: {} {:.0f}".format(file['src_path'], file['datetime'].timestamp()), 2)
-    cursor.execute("INSERT INTO transferred values(?,?)", (file['src_path'], int(file['datetime'].timestamp())))
+    debug("Inserting into transferred db: {} {:.0f} {}".format(file['src_path'], file['datetime'].timestamp(), file['size']), 2)
+    cursor.execute("INSERT INTO transferred values(?,?,?)", (file['src_path'], int(file['datetime'].timestamp()), file['size']))
     conn.commit() # make sure the db is saved in case we get interrupted
     debug("Inserted: {}".format(cursor.lastrowid), 3)
 
@@ -221,6 +230,8 @@ def syncFile(file):
             print() # print line return after progress bar
         print("Transfer interrupted: {}".format(e))
         forceUpdate = True
+    except FileExistsError as e:
+        print(str(e))
 
 def syncDir(dir):
     files = faList(dir)
@@ -230,15 +241,18 @@ def syncDir(dir):
         file['src_path'] = file['dir'].rstrip("/") + "/" + file['name']
         if int(file['attr']) & 16:
             # bit 5 = dir, recurse into dir
-            #dst_dir = args.dest_folder + "/" + file['src_path'].strip("/")
-            #debug("Making directory: " + dst_dir, 3)
-            #makedirs(dst_dir, exist_ok=True)
             syncDir(file['src_path'])
             continue
         file['temp_file'] = tempFile(file['src_path'])
         file['datetime'] = datetime.datetime.combine(parseDate(file['date']), parseTime(file['time']))
 
         syncFile(file)
+
+def cleanup():
+    free = faFree()
+    if free['percent'] < args.cleanup_percent:
+        debug("{:.2f}% free, performing cleanup".format(free['percent']))
+
 
 
 print("Starting " + basename(__file__) + "...")
@@ -247,12 +261,15 @@ print("Syncing " + str(args.source_folder) + " from " + args.flashair_ip)
 while True:
     if alive():
         debug("FlashAir card found!")
-        if forceUpdate or faUpdated():
+        if forceUpdate or args.force or faUpdated():
             forceUpdate = False
             tz = faTimeZone()
 
             for folder in args.source_folder:
                 syncDir(folder)
+
+        if args.cleanup_percent > 0:
+            cleanup()
 
     elif not args.daemon:
         # don't spam the logs when daemonized, but be friendly to humans
