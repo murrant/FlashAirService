@@ -10,14 +10,16 @@ from time import sleep
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-f", "--flashair-ip", default="flashair.local")
+parser.add_argument(dest="flashair_ip", nargs='?', default="flashair")
 parser.add_argument("-s", "--source-folder", default=["/DCIM", "/PRIVATE/AVCHD/BDMV/STREAM"], action='append')
 parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
 parser.add_argument("-c", "--cleanup-percent", type=float, help="Percentage of space to keep free", default=-1)
 parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="count", default=0)
-parser.add_argument("--force", help="skip check for changes, this will cause extra traffic/stress", action="store_true")
+parser.add_argument("-f", "--force", help="skip check for changes, this will cause extra traffic/stress", action="store_true")
 parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
-parser.add_argument("-p", "--progress", help="Print progress for file transfers", action="store_true")
+group = parser.add_mutually_exclusive_group()
+group.add_argument("--progress", dest="progress", help="Print progress for file transfers (default without --daemon)", action="store_true")
+group.add_argument("--no-progress", dest="progress", help="Do not print progress for file transfers (default for --daemon)", action="store_false")
 parser.add_argument("-i", "--interval", type=int, help="Seconds to wait between attempts if running as daemon", default=20)
 args = parser.parse_args()
 
@@ -30,7 +32,7 @@ def debug(message, level=1):
         print(message)
 
 debug("Command line arguments: {}".format(args), 3)
-
+show_progress = args.progress if args.progress else (not args.daemon)
 tz = datetime.timezone.utc
 forceUpdate = False
 TIMEOUT = 5.0 # seconds
@@ -206,12 +208,12 @@ def transferFile(file):
                 if chunk_len == CHUNK_SIZE or bytes_read + chunk_len == file_size:
                     bytes_read += len(chunk)
                     f.write(chunk)
-                    if args.progress:
+                    if show_progress:
                         print_progress(bytes_read / file_size)
                 else:
                     raise IOError("Partial chunk")
 
-            if args.progress:
+            if show_progress:
                 print() # print line return after progress bar
 
     debug("Inserting into transferred db: {} {:.0f} {}".format(file['src_path'], file['datetime'].timestamp(), file['size']), 2)
@@ -231,12 +233,13 @@ def syncFile(file):
             print("Saved to: {}".format(file['dest_path']))
                 
     except (SocketTimeoutError, IOError) as e:
-        if args.progress:
+        if show_progress:
             print() # print line return after progress bar
         print("Transfer interrupted: {}".format(e))
         forceUpdate = True
     except FileExistsError as e:
         print(str(e))
+
 
 def syncDir(dir):
     files = faList(dir)
@@ -275,6 +278,7 @@ def cleanup():
         # remove deleted (or non-existent) files from the db
         query = "DELETE from transferred WHERE ROWID IN ({seq})".format(seq=','.join(['?']*len(deleted)))
         cursor.execute(query, deleted)
+        conn.commit()
         debug("[SQL] {} {}".format(query, deleted) , 4)
 
 
