@@ -13,7 +13,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--flashair-ip", default="flashair.local")
 parser.add_argument("-s", "--source-folder", default=["/DCIM", "/PRIVATE/AVCHD/BDMV/STREAM"], action='append')
 parser.add_argument("-d", "--dest-folder", default=expanduser("~/FlashAir"))
-parser.add_argument("-c", "--cleanup-percent", type=int, help="Percentage of space to keep free", default=-1)
+parser.add_argument("-c", "--cleanup-percent", type=float, help="Percentage of space to keep free", default=-1)
 parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="count", default=0)
 parser.add_argument("--force", help="skip check for changes, this will cause extra traffic/stress", action="store_true")
 parser.add_argument("--daemon", help="Run in a continuous loop", action="store_true")
@@ -37,14 +37,15 @@ TIMEOUT = 5.0 # seconds
 CHUNK_SIZE = 25*1024 # KB
 CSV_LIST_FIELDS = ['dir', 'name', 'size', 'attr', 'date', 'time']
 
+#    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
 #sqlite transferred db
 makedirs(args.dest_folder, exist_ok=True)
 conn = sqlite3.connect(args.dest_folder + "/.transferred.db")
 conn.execute("""CREATE TABLE IF NOT EXISTS  transferred (
-    id INT NOT NULL PRIMARY KEY,
     file TEXT NOT NULL,
     timestamp DATETIME NOT NULL,
-    size INT DEFAULT 0,
+    size INTEGER DEFAULT 0,
     PRIMARY KEY (file, timestamp)
     );""")
 cursor = conn.cursor()
@@ -102,6 +103,10 @@ def faFree():
     total = int(total)
     return {'percent' : free/total*100, 'free' : free*bytes_per, 'total' : total*bytes_per}
 
+def faDelete(filename):
+    result = faCommand("upload.cgi?DEL={}".format(filename));
+    debug("Deleting {}. Result: {}".format(filename, result))
+    return (result == "SUCCESS")
 
 def faUpdated():
     return faCommand("command.cgi?op=102") == "1"
@@ -250,9 +255,27 @@ def syncDir(dir):
 
 def cleanup():
     free = faFree()
+    debug(free, 3)
+    debug("Free space: {:,.3f} GiB".format(free['free'] / 1073741824), 2)
     if free['percent'] < args.cleanup_percent:
-        debug("{:.2f}% free, performing cleanup".format(free['percent']))
+        goal = free['total'] * args.cleanup_percent / 100
+        needed = goal - free['free']
+        deleted = []
+        freed = 0
+        debug("{:.2f}% free, performing cleanup.  Attempting to free {:,.2f} MiB of data.".format(free['percent'], needed / 1048576))
+        cursor.execute("SELECT ROWID, file, size FROM transferred ORDER BY timestamp")
+        for row in cursor:
+            success = faDelete(row[1])
+            deleted.append(row[0])
+            if success:
+                freed += row[2]
+            if freed > needed:
+                break
 
+        # remove deleted (or non-existent) files from the db
+        query = "DELETE from transferred WHERE ROWID IN ({seq})".format(seq=','.join(['?']*len(deleted)))
+        cursor.execute(query, deleted)
+        debug("[SQL] {} {}".format(query, deleted) , 4)
 
 
 print("Starting " + basename(__file__) + "...")
