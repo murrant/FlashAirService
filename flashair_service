@@ -298,10 +298,9 @@ while True:
         if args.cleanup_percent > 0:
             cleanup()
 
-    elif not args.daemon:
+    elif not args.daemon or args.verbosity > 0:
         # don't spam the logs when daemonized, but be friendly to humans
-        print("Could not reach FlashAir card: " + args.flashair_ip)
-
+        print("FlashAir card ({}) not pingable".format(args.flashair_ip))
 
     # only run once by default, if --daemon loop
     if not args.daemon:
